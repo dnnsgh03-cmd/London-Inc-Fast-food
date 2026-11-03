@@ -1,0 +1,21 @@
+{
+  "id": "/",
+  "name": "London Inc Fast Food",
+  "short_name": "London Fast Food",
+  "description": "Sistema de pedidos y control de London Inc Fast Food",
+  "lang": "es",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f5f7fa",
+  "theme_color": "#0b1f4d",
+  "icons": [
+    {
+      "src": "/static/img/pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
