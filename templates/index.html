@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#0b1f4d">
-    <meta name="description" content="Sistema de pedidos y control de London Inc Fast Food">
+    <meta name="description" content="Sistema de pedidos y control en tiempo real de London Inc Fast Food">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>London Inc Fast Food</title>
@@ -15,7 +15,7 @@
         rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
-    <script src="{{ url_for('static', filename='script.js', v='inventory-balance-1') }}" defer></script>
+    <script src="{{ url_for('static', filename='script.js', v='realtime-discord-1') }}" defer></script>
     <script>
         if ("serviceWorker" in navigator) {
             window.addEventListener("load", () => {
@@ -32,10 +32,11 @@
 
     <div style="flex:1">
         <h1>London Inc <span>Fast Food</span></h1>
-        <div class="sub">Salchipapas y más · Sistema de pedidos y control</div>
+        <div class="sub">Salchipapas y más · Sistema en tiempo real</div>
     </div>
 
     <div class="header-actions">
+        <button id="btn-sound-toggle" class="btn line sm noprint" onclick="toggleSound()" title="Activar/Silenciar timbre de pedidos">🔔 Sonido</button>
         <button class="btn green sm noprint" onclick="manualSaveAll()" title="Guardar todo en Excel ahora">Guardar todo</button>
         <form method="post" action="{{ url_for('logout') }}" class="noprint">
             <button class="btn line sm logout-button" type="submit">Cerrar sesión</button>
@@ -46,7 +47,10 @@
     <div class="flag"></div>
     <nav id="nav" aria-label="Navegación principal"></nav>
     <div class="sync-bar">
-        <div id="sync-status" class="sync-status" role="status" aria-live="polite">Conectando con Excel...</div>
+        <div class="sync-left">
+            <span id="live-indicator" class="live-pill" title="Sincronización en tiempo real activa">🟢 En tiempo real</span>
+            <div id="sync-status" class="sync-status" role="status" aria-live="polite">Conectando con el servidor...</div>
+        </div>
         <button id="btn-quick-sync" class="btn line sm noprint" onclick="manualSaveAll()" title="Guardar todos los datos en Excel">Guardar todo en Excel ahora</button>
     </div>
     <main id="m"></main>

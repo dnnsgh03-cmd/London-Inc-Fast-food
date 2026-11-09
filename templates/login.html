@@ -21,6 +21,9 @@
             <label for="password">Contraseña de acceso</label>
             <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
             <button class="btn red" type="submit">Iniciar sesión</button>
+            {% if is_default_password %}
+            <p class="mut" style="font-size:12px;margin-top:12px;text-align:center">Contraseña inicial: <code>london2026</code><br><span style="font-size:11px">Puedes personalizarla con la variable <code>APP_PASSWORD</code></span></p>
+            {% endif %}
         </form>
         {% endif %}
     </main>

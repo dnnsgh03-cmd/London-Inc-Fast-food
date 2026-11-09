@@ -52,6 +52,12 @@ let connectionNoticeShown = false;
 let pendingSaves = 0;
 let filterOrder = "all"; // 'all', 'today', 'pending'
 
+// Variables para sincronización en tiempo real y Discord
+let currentServerVersion = 0;
+let isBackgroundSyncing = false;
+let isSoundEnabled = localStorage.getItem("licSound") !== "false";
+let discordStatus = { configured: false, masked_url: "", source: "none" };
+
 const TABS = [
     ["menu", "Menú QR"],
     ["ped", "Pedidos"],
@@ -208,10 +214,13 @@ function save() {
     updateSaveStatus("Guardando cambios en Excel...", "saving");
     saveQueue = saveQueue
         .then(async () => {
-            await apiRequest("/api/state", { method: "POST", body: serialized });
+            const saveRes = await apiRequest("/api/state", { method: "POST", body: serialized });
             apiConnected = true;
             excelWritable = true;
             connectionNoticeShown = false;
+            if (saveRes && typeof saveRes.version === "number") {
+                currentServerVersion = saveRes.version;
+            }
             try {
                 if (localStorage.getItem("licPending") === serialized) {
                     localStorage.removeItem("licPending");
@@ -284,6 +293,9 @@ async function loadState() {
         apiConnected = true;
         excelWritable = result.writable !== false;
         excelFilename = result.workbook || excelFilename;
+        if (result && typeof result.version === "number") {
+            currentServerVersion = result.version;
+        }
         const pending = JSON.parse(localStorage.getItem("licPending") || "null");
 
         if (pending) {
@@ -323,6 +335,244 @@ async function loadState() {
     }
     updateMenu();
     render();
+    const soundBtn = document.getElementById("btn-sound-toggle");
+    if (soundBtn) {
+        soundBtn.textContent = isSoundEnabled ? "🔔 Sonido activado" : "🔕 Sonido silenciado";
+    }
+    loadDiscordStatus();
+    startRealtimeSync();
+}
+
+function playOrderAlertSound() {
+    if (!isSoundEnabled) return;
+    try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        const ctx = new AudioCtx();
+        if (ctx.state === "suspended") {
+            ctx.resume();
+        }
+        const nowTime = ctx.currentTime;
+        
+        // Tone 1: 587.33 Hz (D5)
+        const osc1 = ctx.createOscillator();
+        const gain1 = ctx.createGain();
+        osc1.type = "sine";
+        osc1.frequency.setValueAtTime(587.33, nowTime);
+        gain1.gain.setValueAtTime(0, nowTime);
+        gain1.gain.linearRampToValueAtTime(0.25, nowTime + 0.04);
+        gain1.gain.exponentialRampToValueAtTime(0.001, nowTime + 0.35);
+        osc1.connect(gain1);
+        gain1.connect(ctx.destination);
+        osc1.start(nowTime);
+        osc1.stop(nowTime + 0.35);
+
+        // Tone 2: 880 Hz (A5)
+        const osc2 = ctx.createOscillator();
+        const gain2 = ctx.createGain();
+        osc2.type = "sine";
+        osc2.frequency.setValueAtTime(880, nowTime + 0.15);
+        gain2.gain.setValueAtTime(0, nowTime + 0.15);
+        gain2.gain.linearRampToValueAtTime(0.3, nowTime + 0.19);
+        gain2.gain.exponentialRampToValueAtTime(0.001, nowTime + 0.65);
+        osc2.connect(gain2);
+        gain2.connect(ctx.destination);
+        osc2.start(nowTime + 0.15);
+        osc2.stop(nowTime + 0.65);
+    } catch (e) {
+        console.warn("Audio chime no disponible:", e);
+    }
+}
+
+function toggleSound() {
+    isSoundEnabled = !isSoundEnabled;
+    try {
+        localStorage.setItem("licSound", isSoundEnabled ? "true" : "false");
+    } catch (e) {}
+    const btn = document.getElementById("btn-sound-toggle");
+    if (btn) {
+        btn.textContent = isSoundEnabled ? "🔔 Sonido activado" : "🔕 Sonido silenciado";
+        btn.title = isSoundEnabled ? "Sonido activo al recibir nuevos pedidos" : "Sonido desactivado";
+    }
+    if (isSoundEnabled) {
+        playOrderAlertSound();
+        toast("Sonido de pedidos activado.");
+    } else {
+        toast("Sonido de pedidos desactivado.");
+    }
+}
+
+function updateLiveIndicator(isLive) {
+    const el = document.getElementById("live-indicator");
+    if (!el) return;
+    if (isLive) {
+        el.className = "live-pill";
+        el.innerHTML = '<span class="live-dot"></span> EN VIVO';
+        el.title = "Sincronización en tiempo real activa entre dispositivos";
+    } else {
+        el.className = "live-pill offline";
+        el.innerHTML = '<span class="live-dot"></span> DESCONECTADO';
+        el.title = "Sin conexión en tiempo real con el servidor";
+    }
+}
+
+async function loadDiscordStatus() {
+    try {
+        const res = await apiRequest("/api/discord/status");
+        if (res && res.ok) {
+            discordStatus = {
+                configured: !!res.configured,
+                masked_url: res.masked_url || "",
+                source: res.source || "none"
+            };
+            if (S.tab === "xls") render();
+        }
+    } catch (e) {
+        console.warn("No se pudo cargar estado de Discord:", e);
+    }
+}
+
+async function testDiscordConnection() {
+    const btn = document.getElementById("btn-test-discord");
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Probando conexión...";
+    }
+    try {
+        const res = await apiRequest("/api/discord/test", { method: "POST" });
+        if (res && res.ok) {
+            toast("✅ Mensaje de prueba enviado con éxito a Discord!");
+            discordStatus.configured = true;
+            render();
+        } else {
+            toast("❌ " + (res.error || "No se pudo conectar con Discord"));
+        }
+    } catch (err) {
+        toast("❌ Error probando Discord: " + err.message);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = "Enviar mensaje de prueba";
+        }
+    }
+}
+
+async function saveDiscordWebhook() {
+    const input = document.getElementById("discord-webhook-input");
+    if (!input) return;
+    const url = input.value.trim();
+    if (!url) {
+        return toast("Ingresa la URL del Webhook de Discord.");
+    }
+    if (!url.startsWith("https://discord.com/api/webhooks/") && !url.startsWith("https://discordapp.com/api/webhooks/")) {
+        return toast("La URL debe ser un webhook válido de Discord (https://discord.com/api/webhooks/...)");
+    }
+    const btn = document.getElementById("btn-save-discord");
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Guardando...";
+    }
+    try {
+        const res = await apiRequest("/api/discord/config", {
+            method: "POST",
+            body: JSON.stringify({ webhook_url: url })
+        });
+        if (res && res.ok) {
+            discordStatus.configured = true;
+            discordStatus.masked_url = res.masked_url;
+            discordStatus.source = "excel";
+            toast("✅ Webhook de Discord guardado correctamente.");
+            render();
+        } else {
+            toast("Error guardando webhook: " + (res.error || "Desconocido"));
+        }
+    } catch (err) {
+        toast("Error guardando webhook: " + err.message);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = "Guardar Webhook";
+        }
+    }
+}
+
+let realtimeSyncInterval = null;
+function startRealtimeSync() {
+    if (realtimeSyncInterval) return;
+    updateLiveIndicator(true);
+
+    const checkVersion = async () => {
+        try {
+            const data = await apiRequest("/api/state/version", {}, 4000);
+            updateLiveIndicator(true);
+            if (data && typeof data.version === "number") {
+                if (currentServerVersion === 0) {
+                    currentServerVersion = data.version;
+                } else if (data.version > currentServerVersion) {
+                    syncRemoteState(data.version);
+                }
+            }
+        } catch (err) {
+            updateLiveIndicator(false);
+        }
+    };
+
+    realtimeSyncInterval = setInterval(checkVersion, 2500);
+
+    window.addEventListener("focus", () => {
+        checkVersion();
+    });
+}
+
+function syncRemoteState(newVersion) {
+    if (isBackgroundSyncing) return;
+    isBackgroundSyncing = true;
+    apiRequest("/api/state", {}, 6000)
+        .then(result => {
+            if (!result || !result.state) return;
+            const remoteOrders = result.state.orders || [];
+            const previousOrders = S.orders || [];
+            
+            // Check for new orders
+            const prevIds = new Set(previousOrders.map(o => o.id));
+            const newOrders = remoteOrders.filter(o => !prevIds.has(o.id));
+
+            // Update core data
+            S.orders = remoteOrders;
+            S.pays = result.state.pays || [];
+            S.moves = result.state.moves || [];
+            S.inv = result.state.inv || S.inv;
+            S.menu = result.state.menu || S.menu;
+            S.staff = result.state.staff || S.staff;
+            S.balanceItems = result.state.balanceItems || [];
+            currentServerVersion = result.version || newVersion;
+
+            try {
+                localStorage.setItem("lic", JSON.stringify(S));
+            } catch (e) {}
+
+            updateMenu();
+            updateLiveIndicator(true);
+
+            if (newOrders.length > 0) {
+                playOrderAlertSound();
+                const latest = newOrders[0];
+                toast(`🔔 ¡Nuevo pedido #${latest.id} (${latest.n || 'Cliente'})! Total: ${F(latest.total)}`);
+            }
+
+            const activeTag = document.activeElement ? document.activeElement.tagName : "";
+            const isTyping = activeTag === "INPUT" || activeTag === "TEXTAREA";
+            if (!isTyping) {
+                render();
+            }
+        })
+        .catch(err => {
+            console.warn("Fallo leve en sincronización remota:", err);
+            updateLiveIndicator(false);
+        })
+        .finally(() => {
+            isBackgroundSyncing = false;
+        });
 }
 
 const F = n => "$" + Number(n).toLocaleString("es-CO");
@@ -447,7 +697,7 @@ async function reg() {
         fec: editingOrder ? editingOrder.fec : todayDate(),
         h: editingOrder ? editingOrder.h : now(),
         n: S.f.n || "Cliente general",
-        address: editingOrder ? editingOrder.address || "" : "",
+        address: (S.f.address || (editingOrder ? editingOrder.address : "") || "").trim(),
         t: S.f.t,
         p: S.f.p,
         comments: (S.f.comments || "").trim(),
@@ -499,12 +749,18 @@ async function reg() {
 function nextSt(i) {
     const L = ["Pendiente", "Preparando", "Entregado"];
     const o = S.orders[i];
+    if (!o) return;
     const currentIndex = L.indexOf(o.st);
     if (currentIndex < 2) {
+        const prevSt = o.st;
         o.st = L[currentIndex + 1];
         save();
         render();
         toast(`Pedido #${o.id} actualizado a: ${o.st}`);
+        apiRequest("/api/discord/order/status", {
+            method: "POST",
+            body: JSON.stringify({ order: o, previous_status: prevSt, new_status: o.st }),
+        }).catch(err => console.log("Aviso de cambio de estado a Discord opcional:", err));
     }
 }
 
@@ -871,13 +1127,18 @@ const V = {
         <div class="row" style="margin-bottom:8px">
             <div style="flex:1">
                 <label style="font-size:12px;font-weight:600;color:var(--mut);display:block;margin-bottom:4px">Tipo</label>
-                <select onchange="S.f.t=this.value;save()">${opt(["Mesa", "Para llevar", "Domicilio"], S.f.t)}</select>
+                <select onchange="S.f.t=this.value;save();render()">${opt(["Mesa", "Para llevar", "Domicilio"], S.f.t)}</select>
             </div>
             <div style="flex:1">
                 <label style="font-size:12px;font-weight:600;color:var(--mut);display:block;margin-bottom:4px">Medio de pago</label>
                 <select onchange="S.f.p=this.value;save()">${opt(["Efectivo", "Nequi", "Daviplata", "Transfiya", "Llave/Bre-B", "Ahorros Davivienda"], S.f.p)}</select>
             </div>
         </div>
+
+        ${S.f.t === "Domicilio" ? `
+        <label style="font-size:12px;font-weight:600;color:var(--mut);display:block;margin-bottom:4px">Dirección de entrega</label>
+        <input placeholder="Ejemplo: Calle 72 # 45-20 Apto 402" value="${escapeHtml(S.f.address || "")}" oninput="S.f.address=this.value;save()">
+        ` : ""}
 
         <label style="font-size:12px;font-weight:600;color:var(--mut);display:block;margin-bottom:4px">Comentarios o instrucciones</label>
         <textarea rows="3" placeholder="Ejemplo: sin salsa, sin chongo o sin verduras" oninput="S.f.comments=this.value;save()">${escapeHtml(S.f.comments || "")}</textarea>
@@ -1178,6 +1439,29 @@ ${!apiConnected ? `
             <p class="mut" style="margin:4px 0 0;font-size:13px">La plataforma guarda automáticamente en cada acción, pero puedes presionar este botón en cualquier momento para forzar el guardado de todos los datos en tu archivo Excel.</p>
         </div>
         <button class="btn green lg" style="margin-top:8px" onclick="manualSaveAll()">Guardar todo en Excel</button>
+    </div>
+</div>
+
+<div class="card discord-card" style="padding:18px">
+    <div class="discord-header">
+        <div>
+            <b style="font-size:17px;color:#5865F2">Conexión con Discord (Alertas en tiempo real)</b>
+            <p class="mut" style="margin:4px 0 0;font-size:13px">Recibe alertas automáticas con sonido e información completa en tu canal de Discord cada vez que haya un nuevo pedido, cambio de estado o edición.</p>
+        </div>
+        <span class="discord-badge ${discordStatus.configured ? '' : 'off'}">
+            ${discordStatus.configured ? '● Discord Conectado' : '○ Discord no configurado'}
+        </span>
+    </div>
+    <div style="margin-top:10px">
+        <label style="font-size:12px;font-weight:600;color:var(--mut);display:block;margin-bottom:4px">URL del Webhook de Discord</label>
+        <div class="discord-input-group">
+            <input id="discord-webhook-input" placeholder="https://discord.com/api/webhooks/..." value="${escapeHtml(discordStatus.masked_url || '')}">
+            <button id="btn-save-discord" class="btn line sm" onclick="saveDiscordWebhook()">Guardar Webhook</button>
+            <button id="btn-test-discord" class="btn sm" style="background:#5865F2;color:#fff" onclick="testDiscordConnection()">Enviar mensaje de prueba</button>
+        </div>
+        <small class="mut" style="display:block;margin-top:8px">
+            💡 <b>¿Cómo obtener la URL?</b> En Discord: clic derecho en tu canal de pedidos &gt; <i>Editar canal</i> &gt; <i>Integraciones</i> &gt; <i>Webhooks</i> &gt; <i>Nuevo Webhook</i> &gt; Copiar URL del Webhook.
+        </small>
     </div>
 </div>
 

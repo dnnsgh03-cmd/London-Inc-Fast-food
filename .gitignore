@@ -13,3 +13,4 @@ __pycache__/
 ~$*.xlsx
 ~$*.xlsm
 *.log
+.secret_key

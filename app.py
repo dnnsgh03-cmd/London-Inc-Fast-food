@@ -4,10 +4,10 @@ from io import BytesIO
 import json
 import mimetypes
 import os
+from pathlib import Path
 import tempfile
 import threading
-from copy import deepcopy
-from pathlib import Path
+import time
 from urllib.parse import urlsplit
 
 import requests
@@ -15,15 +15,82 @@ from flask import Flask, jsonify, redirect, render_template, request, send_file,
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils.exceptions import InvalidFileException
+try:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+except ImportError:
+    ProxyFix = None
 
 
 mimetypes.add_type("text/javascript", ".js")
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# Carga de variables de entorno desde .env si existe
+env_path = BASE_DIR / ".env"
+if env_path.exists():
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+    except Exception:
+        pass
+
 EXCEL_PATH = Path(
     os.environ.get("LONDON_FOOD_EXCEL", str(BASE_DIR / "londoninc.xlsx"))
 ).expanduser().resolve()
 WORKBOOK_LOCK = threading.RLock()
+
+# Control de versión para sincronización en tiempo real
+STATE_VERSION = time.time()
+
+def bump_state_version():
+    global STATE_VERSION
+    STATE_VERSION = time.time()
+    return STATE_VERSION
+
+# URL de webhook de Discord en memoria o guardada en Excel
+CUSTOM_DISCORD_WEBHOOK = None
+
+def get_discord_webhook_url():
+    env_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if env_url and env_url.strip():
+        return env_url.strip()
+    global CUSTOM_DISCORD_WEBHOOK
+    if CUSTOM_DISCORD_WEBHOOK and CUSTOM_DISCORD_WEBHOOK.strip():
+        return CUSTOM_DISCORD_WEBHOOK.strip()
+    return ""
+
+def get_secret_key():
+    key = os.getenv("SECRET_KEY")
+    if key and key.strip():
+        return key.strip()
+    key_file = BASE_DIR / ".secret_key"
+    if key_file.exists():
+        try:
+            stored = key_file.read_text(encoding="utf-8").strip()
+            if stored:
+                return stored
+        except Exception:
+            pass
+    import secrets
+    generated = secrets.token_hex(32)
+    try:
+        key_file.write_text(generated, encoding="utf-8")
+    except Exception:
+        pass
+    return generated
+
+def get_configured_password():
+    pwd = os.getenv("APP_PASSWORD")
+    if pwd and pwd.strip():
+        return pwd.strip()
+    return "london2026"
 
 STAFF = [
     ["Nathan Heilbron Ruff", "Gerente"],
@@ -399,6 +466,10 @@ def sheet_state(workbook):
             state["open"] = parse_float(settings["base_caja"], state["open"])
         if "url_qr" in settings and settings["url_qr"]:
             state["url"] = str(settings["url_qr"]).strip()
+        if "discord_webhook" in settings and settings["discord_webhook"]:
+            global CUSTOM_DISCORD_WEBHOOK
+            CUSTOM_DISCORD_WEBHOOK = str(settings["discord_webhook"]).strip()
+            state["discord_webhook"] = CUSTOM_DISCORD_WEBHOOK
         if settings.get("personal"):
             raw_staff = settings["personal"]
             if isinstance(raw_staff, list):
@@ -489,10 +560,18 @@ def write_state(workbook, state):
             for item in state.get("balanceItems", [])
         ],
     )
+    config_rows = [
+        ["base_caja", state["open"]],
+        ["url_qr", state["url"]],
+        ["personal", json.dumps(state["staff"], ensure_ascii=False)],
+    ]
+    webhook_val = state.get("discord_webhook") or CUSTOM_DISCORD_WEBHOOK
+    if webhook_val:
+        config_rows.append(["discord_webhook", webhook_val])
     set_rows(
         workbook["Configuracion"],
         ["Clave", "Valor"],
-        [["base_caja", state["open"]], ["url_qr", state["url"]], ["personal", json.dumps(state["staff"], ensure_ascii=False)]],
+        config_rows,
     )
     app_state = workbook["AppState"]
     app_state.delete_rows(1, max(app_state.max_row, 1))
@@ -580,20 +659,50 @@ def enviar_alerta_discord(order):
         raise ValueError("El pedido debe incluir al menos un producto.")
     product_lines = []
     for item in items:
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            raise ValueError("El detalle de productos del pedido no es válido.")
-        product_lines.append(f"- {item[1]} x {str(item[0])[:160]}")
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            qty = item[1]
+            name = str(item[0])[:120]
+            price = parse_float(item[2]) if len(item) > 2 else 0
+            if price > 0:
+                product_lines.append(f"• **{qty}x** {name} — *${price*qty:,.0f}*")
+            else:
+                product_lines.append(f"• **{qty}x** {name}")
 
-    lines = [
-        f"**Nuevo pedido #{str(order.get('id', ''))[:30]}**",
-        f"**Cliente:** {str(order.get('n') or 'Cliente general')[:150]}",
-        f"**Dirección:** {str(order.get('address') or 'No indicada')[:250]}",
-        "**Productos:**",
-        *product_lines,
-        f"**Comentarios:** {str(order.get('comments') or 'Sin comentarios')[:500]}",
-        f"**Total a pagar:** ${parse_float(order.get('total')):,.0f}",
-    ]
-    return enviar_mensaje_discord(_limitar_mensaje_discord("\n".join(lines)))
+    total_val = parse_float(order.get("total"))
+    order_id = str(order.get("id", ""))
+    order_type = str(order.get("t") or "Mesa")
+    customer = str(order.get("n") or "Cliente general")
+    payment = str(order.get("p") or "Efectivo")
+    address = str(order.get("address") or "")
+    comments = str(order.get("comments") or "")
+
+    embed = {
+        "title": f"🍔 Nuevo Pedido #{order_id} · {order_type}",
+        "color": 0xC8102E,  # London Red
+        "description": f"**Total a pagar: ${total_val:,.0f} COP**",
+        "fields": [
+            {"name": "👤 Cliente", "value": customer[:100], "inline": True},
+            {"name": "💳 Pago", "value": payment[:50], "inline": True},
+            {"name": "📍 Tipo", "value": order_type[:50], "inline": True},
+        ],
+        "footer": {"text": "London Inc Fast Food · Sistema en tiempo real"},
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+    if address:
+        embed["fields"].append({"name": "🏠 Dirección de entrega", "value": address[:200], "inline": False})
+
+    embed["fields"].append({
+        "name": "🛒 Detalle de productos",
+        "value": "\n".join(product_lines)[:1024] or "Sin detalle",
+        "inline": False,
+    })
+
+    if comments:
+        embed["fields"].append({"name": "📝 Comentarios / Cocina", "value": comments[:500], "inline": False})
+
+    content = f"🔔 **¡Nuevo pedido #{order_id}!** ({order_type} · {customer} · **${total_val:,.0f}**)"
+    return enviar_mensaje_discord(content=content, embeds=[embed])
 
 
 def _limitar_mensaje_discord(content):
@@ -630,7 +739,7 @@ def mensaje_edicion_discord(previous_order, order):
         previous = str(previous_order.get(key) or default)
         updated = str(order.get(key) or default)
         if previous != updated:
-            changes.append(f"**{label}:** ~~{previous[:200]}~~ → **{updated[:200]}**")
+            changes.append(f"• **{label}:** ~~{previous[:100]}~~ → **{updated[:100]}**")
 
     for name in sorted(previous_products.keys() | updated_products.keys()):
         previous = previous_products.get(name)
@@ -639,17 +748,17 @@ def mensaje_edicion_discord(previous_order, order):
             continue
         if previous is None:
             changes.append(
-                f"**Producto agregado:** **{name[:140]}** "
+                f"• **Agregado:** **{name[:100]}** "
                 f"({updated[0]:g} x ${updated[1]:,.0f})"
             )
         elif updated is None:
             changes.append(
-                f"**Producto eliminado:** ~~{name[:140]}~~ "
+                f"• **Eliminado:** ~~{name[:100]}~~ "
                 f"({previous[0]:g} x ${previous[1]:,.0f})"
             )
         else:
             changes.append(
-                f"**Producto modificado:** **{name[:140]}** "
+                f"• **Modificado:** **{name[:100]}** "
                 f"({previous[0]:g} x ${previous[1]:,.0f} → "
                 f"{updated[0]:g} x ${updated[1]:,.0f})"
             )
@@ -657,49 +766,126 @@ def mensaje_edicion_discord(previous_order, order):
     previous_total = parse_float(previous_order.get("total"))
     updated_total = parse_float(order.get("total"))
     if previous_total != updated_total:
-        changes.append(f"**Total:** ~~${previous_total:,.0f}~~ → **${updated_total:,.0f}**")
+        changes.append(f"• **Total:** ~~${previous_total:,.0f}~~ → **${updated_total:,.0f}**")
 
     if not changes:
-        changes.append("No se detectaron cambios en los datos del pedido.")
-    lines = [
-        f"📝 **Pedido #{str(order.get('id', ''))[:30]} editado**",
-        *changes,
-    ]
-    return _limitar_mensaje_discord("\n".join(lines))
+        changes.append("Sin cambios detectados.")
+
+    order_id = str(order.get("id", ""))
+    customer = str(order.get("n") or "Cliente general")
+
+    embed = {
+        "title": f"📝 Pedido #{order_id} Editado",
+        "color": 0xF5C518,  # London Gold
+        "description": f"Se actualizaron los datos del pedido de **{customer}**:",
+        "fields": [
+            {"name": "Cambios realizados", "value": "\n".join(changes)[:1024], "inline": False},
+            {"name": "Nuevo Total", "value": f"**${updated_total:,.0f} COP**", "inline": True},
+        ],
+        "footer": {"text": "London Inc Fast Food · Sistema en tiempo real"},
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    content = f"📝 **Pedido #{order_id} editado:** {customer} (Nuevo Total: **${updated_total:,.0f}**)"
+    return enviar_mensaje_discord(content=content, embeds=[embed])
 
 
-def enviar_mensaje_discord(content):
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+def enviar_cambio_estado_discord(order, previous_status, new_status):
+    order_id = str(order.get("id", ""))
+    customer = str(order.get("n") or "Cliente general")
+    order_type = str(order.get("t") or "Mesa")
+    total_val = parse_float(order.get("total"))
+
+    if new_status == "Preparando":
+        color = 0xF5C518  # Gold
+        emoji = "👨‍🍳"
+        title = f"{emoji} Pedido #{order_id} en Cocina (Preparando)"
+        desc = f"El pedido de **{customer}** ({order_type}) ya está siendo **PREPARADO** en cocina."
+    elif new_status == "Entregado":
+        color = 0x1F9D55  # Green
+        emoji = "✅"
+        title = f"{emoji} Pedido #{order_id} Entregado / Despachado"
+        desc = f"El pedido de **{customer}** ({order_type}) ha sido **ENTREGADO**. ¡Venta finalizada!"
+    else:
+        color = 0x0B1F4D  # Navy
+        emoji = "📋"
+        title = f"{emoji} Pedido #{order_id} actualizado a {new_status}"
+        desc = f"Estado anterior: `{previous_status}` → Nuevo estado: **{new_status}**"
+
+    embed = {
+        "title": title,
+        "color": color,
+        "description": desc,
+        "fields": [
+            {"name": "👤 Cliente", "value": customer[:100], "inline": True},
+            {"name": "📍 Tipo", "value": order_type[:50], "inline": True},
+            {"name": "💰 Total", "value": f"${total_val:,.0f} COP", "inline": True},
+        ],
+        "footer": {"text": "London Inc Fast Food · Sistema en tiempo real"},
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    content = f"{emoji} **Pedido #{order_id} ({customer}):** Ahora está **{new_status.upper()}**"
+    return enviar_mensaje_discord(content=content, embeds=[embed])
+
+
+def enviar_test_discord():
+    embed = {
+        "title": "🧪 London Inc Fast Food · Conexión con Discord Exitosa",
+        "color": 0x1F9D55,
+        "description": "¡Este canal de Discord está conectado y listo para recibir alertas en tiempo real! 🎉\n\n**Alertas automáticas activas:**\n• 🍔 **Nuevos pedidos:** Cliente, productos, total y dirección.\n• 👨‍🍳 **Cocina / Despacho:** Avisos cuando un pedido pasa a *Preparando* o *Entregado*.\n• 📝 **Edición de pedidos:** Resumen de modificaciones.",
+        "fields": [
+            {"name": "⚡ Sincronización", "value": "En vivo (tiempo real)", "inline": True},
+            {"name": "🌐 Plataforma", "value": "Web London Inc Fast Food", "inline": True},
+        ],
+        "footer": {"text": "London Inc Fast Food · Webhook Verificado"},
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    return enviar_mensaje_discord(content="✅ **Prueba de conexión con Discord confirmada**", embeds=[embed])
+
+
+def enviar_mensaje_discord(content=None, embeds=None):
+    webhook_url = get_discord_webhook_url()
     if not webhook_url or not webhook_url.strip():
-        print("Advertencia: DISCORD_WEBHOOK_URL no está configurada; no se enviará la alerta.")
+        print("Advertencia: No hay webhook de Discord configurado; no se enviará la alerta.")
         return None
 
     webhook_url = webhook_url.strip()
     parsed_url = urlsplit(webhook_url)
     if (
         parsed_url.scheme != "https"
-        or parsed_url.hostname != "discord.com"
+        or parsed_url.hostname not in {"discord.com", "discordapp.com"}
         or not parsed_url.path.startswith("/api/webhooks/")
         or parsed_url.query
         or parsed_url.fragment
     ):
-        raise ValueError("DISCORD_WEBHOOK_URL no contiene una URL de webhook válida de Discord.")
+        raise ValueError("La URL ingresada no es un webhook válido de Discord (debe comenzar con https://discord.com/api/webhooks/...).")
+
+    payload = {"allowed_mentions": {"parse": []}}
+    if content:
+        payload["content"] = str(content)[:2000]
+    if embeds:
+        payload["embeds"] = embeds
 
     return requests.post(
         webhook_url,
-        json={"content": content, "allowed_mentions": {"parse": []}},
+        json=payload,
         timeout=8,
         allow_redirects=False,
     )
 
 
 app = Flask(__name__)
+if ProxyFix:
+    try:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+    except Exception:
+        pass
+
 app.json.ensure_ascii = False
 app.config.update(
-    SECRET_KEY=os.getenv("SECRET_KEY"),
+    SECRET_KEY=get_secret_key(),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "true").lower() == "true",
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false" if os.name == "nt" or not os.getenv("RENDER") else "true").lower() == "true",
     PERMANENT_SESSION_LIFETIME=datetime.timedelta(hours=8),
 )
 
@@ -713,12 +899,6 @@ if (os.getenv("RENDER") or os.getenv("RAILWAY_ENVIRONMENT_NAME")) and not os.get
 def require_login():
     if request.endpoint in {"static", "login", "healthz", "service_worker"}:
         return None
-
-    if not os.getenv("APP_PASSWORD") or not app.config.get("SECRET_KEY"):
-        message = "Configura APP_PASSWORD y SECRET_KEY para habilitar el acceso seguro."
-        if request.path.startswith("/api/"):
-            return jsonify({"error": message}), 503
-        return render_template("login.html", error=message, unavailable=True), 503
 
     if not session.get("authenticated"):
         if request.path.startswith("/api/"):
@@ -744,21 +924,19 @@ def index():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    password = os.getenv("APP_PASSWORD")
-    if not password or not app.config.get("SECRET_KEY"):
-        message = "Configura APP_PASSWORD y SECRET_KEY en las variables de entorno."
-        return render_template("login.html", error=message, unavailable=True), 503
+    configured_password = get_configured_password()
+    is_default_password = not os.getenv("APP_PASSWORD")
 
     error = None
     if request.method == "POST":
         supplied_password = request.form.get("password", "")
-        if hmac.compare_digest(supplied_password, password):
+        if hmac.compare_digest(supplied_password, configured_password):
             session.clear()
             session["authenticated"] = True
             session.permanent = True
             return redirect(url_for("index"))
         error = "La contraseña no es correcta."
-    return render_template("login.html", error=error, unavailable=False)
+    return render_template("login.html", error=error, unavailable=False, is_default_password=is_default_password)
 
 
 @app.post("/logout")
@@ -778,6 +956,105 @@ def service_worker():
     response.headers["Service-Worker-Allowed"] = "/"
     response.headers["Cache-Control"] = "no-cache"
     return response
+
+
+@app.get("/api/state/version")
+def get_state_version():
+    return jsonify({
+        "version": STATE_VERSION,
+        "server_time": datetime.datetime.now().isoformat(),
+    })
+
+
+@app.get("/api/discord/status")
+def get_discord_status():
+    url = get_discord_webhook_url()
+    if not url:
+        return jsonify({"configured": False, "masked_url": "", "source": "none"})
+    parts = url.split("/")
+    if len(parts) >= 7:
+        token = parts[-1]
+        masked = f"{'/'.join(parts[:-1])}/{token[:4]}...{token[-4:]}"
+    else:
+        masked = "https://discord.com/api/webhooks/..."
+    return jsonify({
+        "configured": True,
+        "masked_url": masked,
+        "source": "environment" if os.getenv("DISCORD_WEBHOOK_URL") else "workbook",
+    })
+
+
+@app.post("/api/discord/test")
+def test_discord_webhook():
+    url = get_discord_webhook_url()
+    if not url:
+        return jsonify({"error": "No hay ningún webhook de Discord configurado. Configúralo abajo o en las variables de entorno."}), 400
+    try:
+        response = enviar_test_discord()
+        if response is None:
+            return jsonify({"error": "No se pudo preparar el mensaje de prueba."}), 500
+        if not 200 <= response.status_code < 300:
+            return jsonify({"error": f"Discord rechazó la prueba (HTTP {response.status_code}). Verifica que el webhook sea válido y no haya sido borrado."}), 502
+        return jsonify({"sent": True, "message": "¡Mensaje de prueba recibido en Discord con éxito!"})
+    except Exception as error:
+        return jsonify({"error": f"Error al comunicar con Discord: {error}"}), 502
+
+
+@app.post("/api/discord/config")
+def update_discord_config():
+    data = request.get_json(silent=True) or {}
+    webhook_url = str(data.get("webhook_url") or "").strip()
+    if webhook_url:
+        parsed_url = urlsplit(webhook_url)
+        if (
+            parsed_url.scheme != "https"
+            or parsed_url.hostname not in {"discord.com", "discordapp.com"}
+            or not parsed_url.path.startswith("/api/webhooks/")
+        ):
+            return jsonify({"error": "La URL ingresada no es un webhook válido de Discord (debe comenzar con https://discord.com/api/webhooks/...). "}), 400
+
+    global CUSTOM_DISCORD_WEBHOOK
+    CUSTOM_DISCORD_WEBHOOK = webhook_url
+
+    with WORKBOOK_LOCK:
+        try:
+            workbook = load_or_create_workbook()
+            state, _ = read_persisted_state(workbook)
+            state["discord_webhook"] = webhook_url
+            write_state(workbook, state)
+            save_workbook(workbook)
+            workbook.close()
+            bump_state_version()
+        except Exception as e:
+            app.logger.exception("No se pudo guardar la configuración de Discord en Excel")
+
+    return jsonify({
+        "saved": True,
+        "configured": bool(get_discord_webhook_url()),
+        "source": "environment" if os.getenv("DISCORD_WEBHOOK_URL") else "workbook",
+    })
+
+
+@app.post("/api/discord/order/status")
+def notify_discord_order_status():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Datos inválidos."}), 400
+    order = payload.get("order")
+    prev_st = payload.get("previous_status", "")
+    new_st = payload.get("new_status", "")
+    if not isinstance(order, dict) or not new_st:
+        return jsonify({"error": "Faltan datos del pedido o estado."}), 400
+    try:
+        response = enviar_cambio_estado_discord(order, prev_st, new_st)
+    except Exception as error:
+        app.logger.error("No se pudo notificar cambio de estado a Discord: %s", error)
+        return jsonify({"error": str(error)}), 502
+    if response is None:
+        return jsonify({"error": "Discord no está configurado."}), 503
+    if not 200 <= response.status_code < 300:
+        return jsonify({"error": f"Discord rechazó la notificación (HTTP {response.status_code})."}), 502
+    return jsonify({"sent": True})
 
 
 @app.post("/api/discord/order")
@@ -880,6 +1157,7 @@ def get_state():
                     pass
             return jsonify({
                 "state": state,
+                "version": STATE_VERSION,
                 "initialized": initialized,
                 "workbook": EXCEL_PATH.name,
                 "writable": not locked,
@@ -906,8 +1184,26 @@ def save_state():
     try:
         with WORKBOOK_LOCK:
             workbook = load_or_create_workbook()
+
+            # Fusión inteligente de pedidos para evitar sobreescritura concurrente entre dispositivos
+            try:
+                existing_state, _ = read_persisted_state(workbook)
+                existing_orders = existing_state.get("orders", [])
+                incoming_orders = normalized.get("orders", [])
+                incoming_map = {o["id"]: o for o in incoming_orders if isinstance(o, dict) and "id" in o}
+
+                merged_orders = list(incoming_orders)
+                for eo in existing_orders:
+                    if isinstance(eo, dict) and eo.get("id") not in incoming_map:
+                        merged_orders.append(eo)
+                merged_orders.sort(key=lambda x: parse_int(x.get("id", 0)), reverse=True)
+                normalized["orders"] = merged_orders
+            except Exception as merge_err:
+                app.logger.warning("Fusión concurrente de pedidos omitida: %s", merge_err)
+
             write_state(workbook, normalized)
             save_workbook(workbook)
+            bump_state_version()
     except WorkbookLockedError as error:
         return jsonify({"error": str(error)}), 423
     except (OSError, InvalidFileException) as error:
@@ -916,7 +1212,7 @@ def save_state():
     finally:
         if workbook is not None:
             workbook.close()
-    return jsonify({"saved": True, "workbook": EXCEL_PATH.name})
+    return jsonify({"saved": True, "version": STATE_VERSION, "workbook": EXCEL_PATH.name})
 
 
 @app.post("/api/import")
@@ -935,8 +1231,10 @@ def import_excel():
                     save_workbook(workbook)
                 except WorkbookLockedError:
                     locked = True
+            bump_state_version()
             return jsonify({
                 "state": state,
+                "version": STATE_VERSION,
                 "workbook": EXCEL_PATH.name,
                 "writable": not locked,
             })
@@ -957,6 +1255,7 @@ def reset_state():
             state = default_state()
             write_state(workbook, state)
             save_workbook(workbook)
+            bump_state_version()
     except WorkbookLockedError as error:
         return jsonify({"error": str(error)}), 423
     except (OSError, InvalidFileException) as error:
@@ -965,7 +1264,7 @@ def reset_state():
     finally:
         if workbook is not None:
             workbook.close()
-    return jsonify({"state": state, "workbook": EXCEL_PATH.name})
+    return jsonify({"state": state, "version": STATE_VERSION, "workbook": EXCEL_PATH.name})
 
 
 @app.get("/api/excel/download")
